@@ -5,6 +5,7 @@ enum ScanMode {
     case filesOlderThan(days: Int)
     case recursiveFileSearch(name: String)
     case recursiveDirectorySearch(name: String)
+    case universalBinaries
 }
 
 enum PermissionStatus: Equatable {

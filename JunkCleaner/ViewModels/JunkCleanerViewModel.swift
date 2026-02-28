@@ -63,22 +63,35 @@ final class JunkCleanerViewModel: ObservableObject {
 
     func startScan() {
         scanTask?.cancel()
-        categories = scanner.buildCategories()
+
+        // First scan: build all categories. Re-scan: keep existing selections.
+        if categories.isEmpty {
+            categories = scanner.buildCategories()
+        } else {
+            // Reset scan state for selected categories only
+            for index in categories.indices {
+                if categories[index].isSelected {
+                    categories[index].size = 0
+                    categories[index].items = []
+                    categories[index].isScanned = false
+                    categories[index].permissionStatus = .accessible
+                }
+            }
+        }
+
         state = .scanning(progress: 0)
 
         scanTask = Task {
-            let total = Double(categories.count)
+            let selectedIndices = categories.indices.filter { categories[$0].isSelected }
+            let total = Double(selectedIndices.count)
 
-            for (index, category) in categories.enumerated() {
+            for (step, index) in selectedIndices.enumerated() {
                 guard !Task.isCancelled else { return }
 
-                let scanned = await scanner.scan(category: category)
+                let scanned = await scanner.scan(category: categories[index])
+                categories[index] = scanned
 
-                if let catIndex = categories.firstIndex(where: { $0.id == scanned.id }) {
-                    categories[catIndex] = scanned
-                }
-
-                state = .scanning(progress: Double(index + 1) / total)
+                state = .scanning(progress: Double(step + 1) / total)
             }
 
             state = .scanned

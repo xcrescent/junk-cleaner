@@ -28,6 +28,14 @@ final class CleanerService {
                 permanentlyDeletedCount += r.permanentlyDeletedCount
                 errors.append(contentsOf: r.errors)
             }
+
+        case .universalBinaries:
+            for item in category.items {
+                let r = thinAppBundle(at: item.path)
+                freedBytes += r.freed
+                permanentlyDeletedCount += r.permanentlyDeletedCount
+                errors.append(contentsOf: r.errors)
+            }
         }
 
         return CleanResult(
@@ -63,6 +71,78 @@ final class CleanerService {
             result.errors.append(contentsOf: r.errors)
         }
         return result
+    }
+
+    private func thinAppBundle(at appURL: URL) -> DeletionResult {
+        var result = DeletionResult()
+
+        guard let enumerator = fileManager.enumerator(
+            at: appURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return result }
+
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else { continue }
+
+            let ext = fileURL.pathExtension
+            guard ext == "dylib" || ext == "" || ext == "so" else { continue }
+
+            // Check if this binary is universal with x86_64
+            guard isUniversalWithIntel(fileURL) else { continue }
+
+            let sizeBefore = ScannerService.allocatedSize(of: fileURL)
+            if thinBinary(at: fileURL) {
+                let sizeAfter = ScannerService.allocatedSize(of: fileURL)
+                result.freed += sizeBefore - sizeAfter
+                result.permanentlyDeletedCount += 1
+            } else {
+                result.errors.append("\(fileURL.lastPathComponent): failed to thin")
+            }
+        }
+
+        return result
+    }
+
+    private func isUniversalWithIntel(_ url: URL) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/lipo")
+        process.arguments = ["-archs", url.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return false }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let archs = String(data: data, encoding: .utf8) ?? ""
+            return archs.contains("x86_64") && archs.contains("arm64")
+        } catch { return false }
+    }
+
+    private func thinBinary(at url: URL) -> Bool {
+        let tmpURL = url.appendingPathExtension("arm64_thin")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/lipo")
+        process.arguments = ["-remove", "x86_64", url.path, "-output", tmpURL.path]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                try? fileManager.removeItem(at: tmpURL)
+                return false
+            }
+            try fileManager.removeItem(at: url)
+            try fileManager.moveItem(at: tmpURL, to: url)
+            return true
+        } catch {
+            try? fileManager.removeItem(at: tmpURL)
+            return false
+        }
     }
 
     private func removeSingleItem(at url: URL, mode: DeletionMode) -> DeletionResult {

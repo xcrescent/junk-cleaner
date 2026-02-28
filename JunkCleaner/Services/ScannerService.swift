@@ -136,6 +136,15 @@ final class ScannerService {
                 scanMode: .recursiveDirectorySearch(name: "node_modules")
             ),
             JunkCategory(
+                id: "universal_binaries",
+                name: "Intel Code in Apps",
+                description: "x86_64 slices in universal app binaries",
+                icon: "cpu",
+                paths: [URL(fileURLWithPath: "/Applications")],
+                scanMode: .universalBinaries,
+                isSelected: false
+            ),
+            JunkCategory(
                 id: "ds_store",
                 name: ".DS_Store Files",
                 description: "Finder metadata files in common directories",
@@ -207,6 +216,18 @@ final class ScannerService {
                 let (foundItems, foundSize) = scanForDirectories(named: name, in: path)
                 items.append(contentsOf: foundItems)
                 totalSize += foundSize
+            }
+
+        case .universalBinaries:
+            for path in category.paths {
+                guard fileManager.fileExists(atPath: path.path) else { continue }
+                do {
+                    let (uniItems, uniSize) = try scanForUniversalBinaries(in: path)
+                    items.append(contentsOf: uniItems)
+                    totalSize += uniSize
+                } catch let error as NSError where error.isPermissionError {
+                    restrictedPaths.append(path.path)
+                } catch {}
             }
         }
 
@@ -331,6 +352,119 @@ final class ScannerService {
         }
 
         return (items.sorted { $0.size > $1.size }, totalSize)
+    }
+
+    // MARK: - Universal Binary Scanning
+
+    private func scanForUniversalBinaries(in applicationsDir: URL) throws -> ([JunkItem], Int64) {
+        let contents = try fileManager.contentsOfDirectory(
+            at: applicationsDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        var items: [JunkItem] = []
+        var totalSize: Int64 = 0
+
+        for appURL in contents {
+            guard appURL.pathExtension == "app" else { continue }
+
+            let macosDir = appURL.appending(path: "Contents/MacOS")
+            guard fileManager.fileExists(atPath: macosDir.path) else { continue }
+
+            var appSavings: Int64 = 0
+            let machoBinaries = findMachOFiles(in: appURL)
+
+            for binary in machoBinaries {
+                if let savings = intelSliceSize(of: binary) {
+                    appSavings += savings
+                }
+            }
+
+            if appSavings > 0 {
+                items.append(JunkItem(
+                    name: appURL.lastPathComponent,
+                    path: appURL,
+                    size: appSavings,
+                    modifiedDate: nil,
+                    isDirectory: true
+                ))
+                totalSize += appSavings
+            }
+        }
+
+        return (items.sorted { $0.size > $1.size }, totalSize)
+    }
+
+    private func findMachOFiles(in appURL: URL) -> [URL] {
+        guard let enumerator = fileManager.enumerator(
+            at: appURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isExecutableKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var binaries: [URL] = []
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else { continue }
+
+            let ext = fileURL.pathExtension
+            if ext == "dylib" || ext == "" || ext == "so" {
+                binaries.append(fileURL)
+            }
+        }
+        return binaries
+    }
+
+    private func intelSliceSize(of binaryURL: URL) -> Int64? {
+        let archs = runLipo(args: ["-archs", binaryURL.path])
+        guard let archs = archs else { return nil }
+
+        let archList = archs.split(separator: " ").map(String.init)
+        guard archList.contains("x86_64"), archList.contains("arm64") else { return nil }
+
+        // Parse detailed info to get exact x86_64 slice size
+        guard let detailedInfo = runLipo(args: ["-detailed_info", binaryURL.path]) else { return nil }
+
+        var inX86Section = false
+        for line in detailedInfo.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("architecture x86_64") || trimmed.hasPrefix("Fat architecture x86_64") {
+                inX86Section = true
+            } else if trimmed.hasPrefix("architecture ") || trimmed.hasPrefix("Fat architecture ") {
+                inX86Section = false
+            } else if inX86Section && trimmed.hasPrefix("size") {
+                let parts = trimmed.split(separator: " ")
+                if parts.count >= 2, let size = Int64(parts[1]) {
+                    return size
+                }
+            }
+        }
+
+        // Fallback: estimate as half the binary size
+        let fileValues = try? binaryURL.resourceValues(forKeys: [.fileSizeKey])
+        if let fileSize = fileValues?.fileSize {
+            return Int64(fileSize) / 2
+        }
+        return nil
+    }
+
+    private func runLipo(args: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/lipo")
+        process.arguments = args
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            return nil
+        }
     }
 
     static func allocatedSize(of url: URL) -> Int64 {
