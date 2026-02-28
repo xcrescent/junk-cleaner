@@ -5,6 +5,15 @@ struct CategoryRowView: View {
     let isExpanded: Bool
     let onToggleSelected: () -> Void
     let onToggleExpanded: () -> Void
+    let onRevealInFinder: (URL) -> Void
+
+    @State private var isHovered = false
+
+    private var sizeColor: Color {
+        if category.size < 100_000_000 { return .green }
+        if category.size < 1_000_000_000 { return .orange }
+        return .red
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -27,6 +36,11 @@ struct CategoryRowView: View {
                     Text(category.description)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if case .partialAccess(let restricted) = category.permissionStatus {
+                        Text("\(restricted.count) path(s) restricted")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
                 }
 
                 Spacer()
@@ -34,7 +48,19 @@ struct CategoryRowView: View {
                 if category.isScanned {
                     Text(category.formattedSize)
                         .font(.body.monospacedDigit())
-                        .foregroundStyle(category.size > 0 ? .primary : .secondary)
+                        .foregroundStyle(category.size > 0 ? sizeColor : .secondary)
+
+                    if case .partialAccess = category.permissionStatus {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.yellow)
+                            .help("Some items could not be accessed. Grant Full Disk Access for a complete scan.")
+                    } else if case .denied = category.permissionStatus {
+                        Image(systemName: "lock.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .help("Permission denied. Grant Full Disk Access to scan this category.")
+                    }
                 } else {
                     ProgressView()
                         .controlSize(.small)
@@ -53,9 +79,18 @@ struct CategoryRowView: View {
             .contentShape(Rectangle())
 
             if isExpanded {
-                CategoryDetailView(items: category.items)
+                CategoryDetailView(items: category.items, onRevealInFinder: onRevealInFinder)
                     .padding(.leading, 56)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .background(isHovered ? Color.primary.opacity(0.04) : Color.clear)
+        .cornerRadius(6)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isHovered = hovering
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: isExpanded)
     }
 }

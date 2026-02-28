@@ -1,5 +1,12 @@
 import Foundation
 
+extension NSError {
+    var isPermissionError: Bool {
+        (domain == NSCocoaErrorDomain && code == NSFileReadNoPermissionError) ||
+        (domain == NSPOSIXErrorDomain && code == Int(EACCES))
+    }
+}
+
 final class ScannerService {
     private let fileManager = FileManager.default
 
@@ -29,6 +36,14 @@ final class ScannerService {
                 description: "~/Library/Developer/Xcode/DerivedData/",
                 icon: "hammer",
                 paths: [home.appending(path: "Library/Developer/Xcode/DerivedData")],
+                scanMode: .directorySize
+            ),
+            JunkCategory(
+                id: "xcode_simulators",
+                name: "Xcode Simulators",
+                description: "~/Library/Developer/CoreSimulator/Devices/",
+                icon: "iphone",
+                paths: [home.appending(path: "Library/Developer/CoreSimulator/Devices")],
                 scanMode: .directorySize
             ),
             JunkCategory(
@@ -64,6 +79,22 @@ final class ScannerService {
                 scanMode: .directorySize
             ),
             JunkCategory(
+                id: "cocoapods_cache",
+                name: "CocoaPods Cache",
+                description: "~/Library/Caches/CocoaPods/",
+                icon: "leaf",
+                paths: [home.appending(path: "Library/Caches/CocoaPods")],
+                scanMode: .directorySize
+            ),
+            JunkCategory(
+                id: "gradle_cache",
+                name: "Gradle Cache",
+                description: "~/.gradle/caches/",
+                icon: "gearshape.2",
+                paths: [home.appending(path: ".gradle/caches")],
+                scanMode: .directorySize
+            ),
+            JunkCategory(
                 id: "browser_caches",
                 name: "Browser Caches",
                 description: "Safari, Chrome, Firefox caches",
@@ -90,6 +121,19 @@ final class ScannerService {
                 icon: "trash",
                 paths: [home.appending(path: ".Trash")],
                 scanMode: .directorySize
+            ),
+            JunkCategory(
+                id: "node_modules",
+                name: "node_modules",
+                description: "Node.js dependency folders",
+                icon: "cube.box.fill",
+                paths: [
+                    home.appending(path: "Projects"),
+                    home.appending(path: "Developer"),
+                    home.appending(path: "Desktop"),
+                    home.appending(path: "Documents"),
+                ],
+                scanMode: .recursiveDirectorySearch(name: "node_modules")
             ),
             JunkCategory(
                 id: "ds_store",
@@ -119,23 +163,34 @@ final class ScannerService {
         var result = category
         var items: [JunkItem] = []
         var totalSize: Int64 = 0
+        var restrictedPaths: [String] = []
 
         switch category.scanMode {
         case .directorySize:
             for path in category.paths {
                 guard fileManager.fileExists(atPath: path.path) else { continue }
-                let (dirItems, dirSize) = scanDirectory(at: path)
-                items.append(contentsOf: dirItems)
-                totalSize += dirSize
+                do {
+                    let (dirItems, dirSize) = try scanDirectory(at: path)
+                    items.append(contentsOf: dirItems)
+                    totalSize += dirSize
+                } catch let error as NSError where error.isPermissionError {
+                    restrictedPaths.append(path.path)
+                } catch {
+                    // Other errors: skip silently
+                }
             }
 
         case .filesOlderThan(let days):
             let cutoffDate = Calendar.current.date(byAdding: .day, value: -days, to: Date())!
             for path in category.paths {
                 guard fileManager.fileExists(atPath: path.path) else { continue }
-                let (oldItems, oldSize) = scanForOldFiles(at: path, olderThan: cutoffDate)
-                items.append(contentsOf: oldItems)
-                totalSize += oldSize
+                do {
+                    let (oldItems, oldSize) = try scanForOldFiles(at: path, olderThan: cutoffDate)
+                    items.append(contentsOf: oldItems)
+                    totalSize += oldSize
+                } catch let error as NSError where error.isPermissionError {
+                    restrictedPaths.append(path.path)
+                } catch {}
             }
 
         case .recursiveFileSearch(let name):
@@ -145,54 +200,81 @@ final class ScannerService {
                 items.append(contentsOf: foundItems)
                 totalSize += foundSize
             }
+
+        case .recursiveDirectorySearch(let name):
+            for path in category.paths {
+                guard fileManager.fileExists(atPath: path.path) else { continue }
+                let (foundItems, foundSize) = scanForDirectories(named: name, in: path)
+                items.append(contentsOf: foundItems)
+                totalSize += foundSize
+            }
         }
 
         result.items = items
         result.size = totalSize
+
+        if !restrictedPaths.isEmpty {
+            result.permissionStatus = items.isEmpty
+                ? .denied
+                : .partialAccess(restrictedPaths: restrictedPaths)
+        }
+
         result.isScanned = true
         return result
     }
 
     // MARK: - Private Helpers
 
-    private func scanDirectory(at url: URL) -> ([JunkItem], Int64) {
-        guard let contents = try? fileManager.contentsOfDirectory(
+    private func scanDirectory(at url: URL) throws -> ([JunkItem], Int64) {
+        let contents = try fileManager.contentsOfDirectory(
             at: url,
             includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .contentModificationDateKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
-        ) else { return ([], 0) }
+        )
 
         var items: [JunkItem] = []
         var totalSize: Int64 = 0
 
         for itemURL in contents {
             let itemSize = Self.allocatedSize(of: itemURL)
-            let modDate = (try? itemURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            let values = try? itemURL.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey])
 
-            items.append(JunkItem(name: itemURL.lastPathComponent, path: itemURL, size: itemSize, modifiedDate: modDate))
+            items.append(JunkItem(
+                name: itemURL.lastPathComponent,
+                path: itemURL,
+                size: itemSize,
+                modifiedDate: values?.contentModificationDate,
+                isDirectory: values?.isDirectory ?? false
+            ))
             totalSize += itemSize
         }
 
         return (items.sorted { $0.size > $1.size }, totalSize)
     }
 
-    private func scanForOldFiles(at url: URL, olderThan cutoff: Date) -> ([JunkItem], Int64) {
-        guard let contents = try? fileManager.contentsOfDirectory(
+    private func scanForOldFiles(at url: URL, olderThan cutoff: Date) throws -> ([JunkItem], Int64) {
+        let contents = try fileManager.contentsOfDirectory(
             at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .contentModificationDateKey],
+            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .contentModificationDateKey, .isDirectoryKey],
             options: []
-        ) else { return ([], 0) }
+        )
 
         var items: [JunkItem] = []
         var totalSize: Int64 = 0
 
         for itemURL in contents {
-            guard let values = try? itemURL.resourceValues(forKeys: [.contentModificationDateKey]),
+            guard let values = try? itemURL.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey]),
                   let modDate = values.contentModificationDate,
                   modDate < cutoff else { continue }
 
             let itemSize = Self.allocatedSize(of: itemURL)
-            items.append(JunkItem(name: itemURL.lastPathComponent, path: itemURL, size: itemSize, modifiedDate: modDate))
+            items.append(JunkItem(
+                name: itemURL.lastPathComponent,
+                path: itemURL,
+                size: itemSize,
+                modifiedDate: modDate,
+                isDirectory: values.isDirectory ?? false
+            ))
             totalSize += itemSize
         }
 
@@ -216,11 +298,39 @@ final class ScannerService {
                 of: fileManager.homeDirectoryForCurrentUser.path,
                 with: "~"
             )
-            items.append(JunkItem(name: displayName, path: fileURL, size: itemSize, modifiedDate: nil))
+            items.append(JunkItem(name: displayName, path: fileURL, size: itemSize, modifiedDate: nil, isDirectory: false))
             totalSize += itemSize
         }
 
         return (items, totalSize)
+    }
+
+    private func scanForDirectories(named name: String, in directory: URL) -> ([JunkItem], Int64) {
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey, .totalFileAllocatedSizeKey],
+            options: [.skipsPackageDescendants, .skipsHiddenFiles]
+        ) else { return ([], 0) }
+
+        var items: [JunkItem] = []
+        var totalSize: Int64 = 0
+
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isDirectoryKey]),
+                  values.isDirectory == true,
+                  fileURL.lastPathComponent == name else { continue }
+
+            enumerator.skipDescendants()
+            let itemSize = Self.allocatedSize(of: fileURL)
+            let displayName = fileURL.path.replacingOccurrences(
+                of: fileManager.homeDirectoryForCurrentUser.path,
+                with: "~"
+            )
+            items.append(JunkItem(name: displayName, path: fileURL, size: itemSize, modifiedDate: nil, isDirectory: true))
+            totalSize += itemSize
+        }
+
+        return (items.sorted { $0.size > $1.size }, totalSize)
     }
 
     static func allocatedSize(of url: URL) -> Int64 {

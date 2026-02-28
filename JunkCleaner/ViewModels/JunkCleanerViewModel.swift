@@ -1,11 +1,12 @@
 import Foundation
+import AppKit
 
 enum AppState: Equatable {
     case idle
     case scanning(progress: Double)
     case scanned
     case cleaning(progress: Double)
-    case cleaned(freedBytes: Int64)
+    case cleaned(freedBytes: Int64, trashedCount: Int, permanentlyDeletedCount: Int)
     case error(message: String)
 }
 
@@ -14,6 +15,8 @@ final class JunkCleanerViewModel: ObservableObject {
     @Published var categories: [JunkCategory] = []
     @Published var state: AppState = .idle
     @Published var expandedCategoryID: String? = nil
+    @Published var showCleanConfirmation: Bool = false
+    @Published var deletionMode: DeletionMode = .moveToTrash
 
     private let scanner = ScannerService()
     private let cleaner = CleanerService()
@@ -49,6 +52,13 @@ final class JunkCleanerViewModel: ObservableObject {
         }
     }
 
+    var categoriesWithPermissionIssues: [JunkCategory] {
+        categories.filter {
+            if case .accessible = $0.permissionStatus { return false }
+            return true
+        }
+    }
+
     // MARK: - Actions
 
     func startScan() {
@@ -75,7 +85,15 @@ final class JunkCleanerViewModel: ObservableObject {
         }
     }
 
-    func startClean() {
+    func requestClean() {
+        guard hasScanned else { return }
+        let selectedCategories = categories.filter(\.isSelected)
+        guard !selectedCategories.isEmpty else { return }
+        showCleanConfirmation = true
+    }
+
+    func confirmClean() {
+        showCleanConfirmation = false
         guard hasScanned else { return }
 
         let selectedCategories = categories.filter(\.isSelected)
@@ -85,30 +103,34 @@ final class JunkCleanerViewModel: ObservableObject {
 
         Task {
             var totalFreed: Int64 = 0
+            var totalTrashed = 0
+            var totalPermanentlyDeleted = 0
             let total = Double(selectedCategories.count)
-            var errors: [String] = []
+            var allErrors: [String] = []
 
             for (index, category) in selectedCategories.enumerated() {
-                do {
-                    let freed = try await cleaner.clean(category: category)
-                    totalFreed += freed
+                // Force permanent delete for Trash category (can't trash items already in Trash)
+                let mode: DeletionMode = category.id == "trash" ? .deletePermanently : deletionMode
 
-                    if let catIndex = categories.firstIndex(where: { $0.id == category.id }) {
-                        categories[catIndex].size = 0
-                        categories[catIndex].items = []
-                        categories[catIndex].isScanned = false
-                    }
-                } catch {
-                    errors.append("\(category.name): \(error.localizedDescription)")
+                let result = await cleaner.clean(category: category, mode: mode)
+                totalFreed += result.freedBytes
+                totalTrashed += result.trashedCount
+                totalPermanentlyDeleted += result.permanentlyDeletedCount
+                allErrors.append(contentsOf: result.errors)
+
+                if let catIndex = categories.firstIndex(where: { $0.id == category.id }) {
+                    categories[catIndex].size = 0
+                    categories[catIndex].items = []
+                    categories[catIndex].isScanned = false
                 }
 
                 state = .cleaning(progress: Double(index + 1) / total)
             }
 
-            if errors.isEmpty {
-                state = .cleaned(freedBytes: totalFreed)
+            if allErrors.isEmpty {
+                state = .cleaned(freedBytes: totalFreed, trashedCount: totalTrashed, permanentlyDeletedCount: totalPermanentlyDeleted)
             } else {
-                state = .error(message: errors.joined(separator: "\n"))
+                state = .error(message: allErrors.joined(separator: "\n"))
             }
         }
     }
@@ -133,5 +155,15 @@ final class JunkCleanerViewModel: ObservableObject {
 
     func toggleExpanded(_ id: String) {
         expandedCategoryID = expandedCategoryID == id ? nil : id
+    }
+
+    func revealInFinder(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func openFullDiskAccessSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
     }
 }

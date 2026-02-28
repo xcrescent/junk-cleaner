@@ -8,6 +8,9 @@ struct ContentView: View {
             headerSection
             Divider()
 
+            // Progress bar during scan/clean
+            progressBar
+
             if viewModel.categories.isEmpty {
                 emptyState
             } else {
@@ -18,6 +21,9 @@ struct ContentView: View {
             footerSection
         }
         .frame(minWidth: 600, minHeight: 450)
+        .sheet(isPresented: $viewModel.showCleanConfirmation) {
+            CleanConfirmationView(viewModel: viewModel)
+        }
     }
 
     // MARK: - Header
@@ -41,6 +47,8 @@ struct ContentView: View {
                     Text(viewModel.formattedTotalSize)
                         .font(.title2.bold())
                         .foregroundStyle(.orange)
+                        .contentTransition(.numericText())
+                        .animation(.spring, value: viewModel.totalSize)
                     Text("total junk found")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -48,6 +56,24 @@ struct ContentView: View {
             }
         }
         .padding()
+    }
+
+    // MARK: - Progress Bar
+
+    @ViewBuilder
+    private var progressBar: some View {
+        switch viewModel.state {
+        case .scanning(let progress):
+            ProgressView(value: progress)
+                .tint(.orange)
+                .animation(.easeInOut, value: progress)
+        case .cleaning(let progress):
+            ProgressView(value: progress)
+                .tint(.red)
+                .animation(.easeInOut, value: progress)
+        default:
+            EmptyView()
+        }
     }
 
     // MARK: - Empty State
@@ -75,8 +101,11 @@ struct ContentView: View {
                     category: category,
                     isExpanded: viewModel.expandedCategoryID == category.id,
                     onToggleSelected: { viewModel.toggleCategory(category.id) },
-                    onToggleExpanded: { viewModel.toggleExpanded(category.id) }
+                    onToggleExpanded: { viewModel.toggleExpanded(category.id) },
+                    onRevealInFinder: { url in viewModel.revealInFinder(url) }
                 )
+                .opacity(category.isScanned ? 1.0 : 0.6)
+                .animation(.easeIn(duration: 0.3), value: category.isScanned)
             }
         }
         .listStyle(.inset(alternatesRowBackgrounds: true))
@@ -92,6 +121,16 @@ struct ContentView: View {
                 Button("Deselect All") { viewModel.deselectAll() }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
+
+                if !viewModel.categoriesWithPermissionIssues.isEmpty {
+                    Button {
+                        viewModel.openFullDiskAccessSettings()
+                    } label: {
+                        Label("Grant Full Disk Access", systemImage: "lock.shield")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.orange)
+                }
 
                 Spacer()
 
@@ -117,10 +156,11 @@ struct ContentView: View {
 
             if viewModel.hasScanned {
                 Button("Clean Selected") {
-                    viewModel.startClean()
+                    viewModel.requestClean()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
+                .controlSize(.large)
                 .disabled(viewModel.isWorking || viewModel.selectedSize == 0)
             }
         }
@@ -138,15 +178,27 @@ struct ContentView: View {
             Text("Cleaning... \(Int(progress * 100))%")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-        case .cleaned(let freedBytes):
-            Text("Freed \(ByteCountFormatter.string(fromByteCount: freedBytes, countStyle: .file))")
-                .font(.caption)
-                .foregroundStyle(.green)
+        case .cleaned(let freedBytes, let trashedCount, let permanentlyDeletedCount):
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("Freed \(ByteCountFormatter.string(fromByteCount: freedBytes, countStyle: .file))")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                if trashedCount > 0 {
+                    Text("\(trashedCount) items moved to Trash")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if permanentlyDeletedCount > 0 {
+                    Text("\(permanentlyDeletedCount) items permanently deleted")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
         case .error(let message):
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.red)
-                .lineLimit(1)
+                .lineLimit(2)
                 .help(message)
         default:
             EmptyView()
